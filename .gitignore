@@ -1,0 +1,32 @@
+﻿# Python temporary files
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloaded datasets and generated preprocessing data
+English/raw_data/
+English/preprocessed_data/
+Telugu/raw_data/
+Telugu/preprocessed_data/
+
+# Model outputs and checkpoints
+English/output/
+Telugu/output/
+*.pth
+*.pt
+*.ckpt
+
+# Generated audio and feature files
+*.wav
+*.npy
+*.TextGrid
+
+# Logs and operating-system files
+*.log
+.DS_Store
+Thumbs.db

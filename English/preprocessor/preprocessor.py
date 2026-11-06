@@ -1,6 +1,8 @@
 import os
 import random
 import json
+import csv
+import re
 
 import tgt
 import librosa
@@ -51,6 +53,9 @@ class Preprocessor:
         )
 
     def build_from_path(self):
+        if self.config.get("dataset") == "Svarah":
+            return self.build_svarah_from_path()
+        
         os.makedirs((os.path.join(self.out_dir, "mel")), exist_ok=True)
         os.makedirs((os.path.join(self.out_dir, "pitch")), exist_ok=True)
         os.makedirs((os.path.join(self.out_dir, "energy")), exist_ok=True)
@@ -65,25 +70,31 @@ class Preprocessor:
         # Compute pitch, energy, duration, and mel-spectrogram
         speakers = {}
         for i, speaker in enumerate(tqdm(os.listdir(self.in_dir))):
-            speakers[speaker] = i
             for wav_name in os.listdir(os.path.join(self.in_dir, speaker)):
-                if ".wav" not in wav_name:
+                if not wav_name.endswith(".wav"):
                     continue
 
                 basename = wav_name.split(".")[0]
+
                 tg_path = os.path.join(
                     self.out_dir, "TextGrid", speaker, "{}.TextGrid".format(basename)
                 )
-                if os.path.exists(tg_path):
-                    ret = self.process_utterance(speaker, basename)
-                    if ret is None:
-                        continue
-                    else:
-                        info, pitch, energy, n = ret
-                    out.append(info)
+
+                if not os.path.exists(tg_path):
+                    continue
+
+                ret = self.process_utterance(speaker, basename)
+
+                if ret is None:
+                    continue
+
+                info, pitch, energy, n = ret
+
+                out.append(info)
 
                 if len(pitch) > 0:
                     pitch_scaler.partial_fit(pitch.reshape((-1, 1)))
+
                 if len(energy) > 0:
                     energy_scaler.partial_fit(energy.reshape((-1, 1)))
 
@@ -151,6 +162,319 @@ class Preprocessor:
                 f.write(m + "\n")
 
         return out
+    def build_svarah_from_path(self):
+        # Create feature folders
+        for folder in ["mel", "pitch", "energy", "duration"]:
+            os.makedirs(os.path.join(self.out_dir, folder), exist_ok=True)
+
+        train_csv = self.config["path"]["train_csv"]
+        val_csv = self.config["path"]["val_csv"]
+
+        # Read the verified CSV files
+        def read_split(csv_path):
+            if not os.path.isfile(csv_path):
+                raise FileNotFoundError(
+                    "CSV file not found: {}".format(csv_path)
+                )
+
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                return list(csv.DictReader(f))
+
+        train_rows = read_split(train_csv)
+        val_rows = read_split(val_csv)
+
+        # Get filenames and speaker IDs
+        def prepare_rows(rows, split_name):
+            prepared = []
+
+            for row in rows:
+                filename = row["filename"]
+                basename = os.path.splitext(filename)[0]
+
+                match = re.match(r"^\d+_(f\d+)_chunk_", basename)
+
+                if not match:
+                    raise ValueError(
+                        "Cannot identify speaker from filename: {}".format(
+                            filename
+                        )
+                    )
+
+                speaker = match.group(1)
+
+                wav_path = os.path.join(
+                    self.in_dir, speaker, basename + ".wav"
+                )
+                lab_path = os.path.join(
+                    self.in_dir, speaker, basename + ".lab"
+                )
+                tg_path = os.path.join(
+                    self.out_dir, "TextGrid", speaker,
+                    basename + ".TextGrid"
+                )
+
+                for path in [wav_path, lab_path, tg_path]:
+                    if not os.path.isfile(path):
+                        raise FileNotFoundError(
+                            "Required file missing: {}".format(path)
+                        )
+
+                prepared.append({
+                    "speaker": speaker,
+                    "basename": basename,
+                    "filename": filename,
+                    "split": split_name
+                })
+
+            return prepared
+
+        train_items = prepare_rows(train_rows, "train")
+        val_items = prepare_rows(val_rows, "val")
+
+        # Prevent train-validation overlap
+        train_names = {item["filename"] for item in train_items}
+        val_names = {item["filename"] for item in val_items}
+
+        if train_names.intersection(val_names):
+            raise ValueError("Training and validation files overlap!")
+
+        # Every validation speaker must exist in training
+        train_speakers = sorted({
+            item["speaker"] for item in train_items
+        })
+
+        val_speakers = {
+            item["speaker"] for item in val_items
+        }
+
+        unknown_speakers = val_speakers - set(train_speakers)
+
+        if unknown_speakers:
+            raise ValueError(
+                "Validation contains speakers absent from training: {}".format(
+                    sorted(unknown_speakers)
+                )
+            )
+
+        print("Training recordings:", len(train_items))
+        print("Validation recordings:", len(val_items))
+        print("Training speakers in CSV:", len(train_speakers))
+
+        # Process recordings
+        pitch_scaler = StandardScaler()
+        energy_scaler = StandardScaler()
+
+        processed_train = []
+        processed_val = []
+
+        skipped = []
+        total_frames = 0
+
+        all_items = train_items + val_items
+
+        for item in tqdm(all_items, desc="Processing Svarah"):
+            speaker = item["speaker"]
+            basename = item["basename"]
+
+            ret = self.process_utterance(speaker, basename)
+
+            if ret is None:
+                skipped.append(item["filename"])
+                continue
+
+            info, pitch, energy, n_frames = ret
+
+            result = {
+                "info": info,
+                "speaker": speaker,
+                "basename": basename,
+                "split": item["split"]
+            }
+
+            if item["split"] == "train":
+                processed_train.append(result)
+
+                if len(pitch) > 0:
+                    pitch_scaler.partial_fit(
+                        pitch.reshape((-1, 1))
+                    )
+
+                if len(energy) > 0:
+                    energy_scaler.partial_fit(
+                        energy.reshape((-1, 1))
+                    )
+
+            else:
+                processed_val.append(result)
+
+            total_frames += n_frames
+                # Include only speakers with successfully processed training data
+        processed_train_speakers = sorted({
+            item["speaker"] for item in processed_train
+        })
+
+        processed_val_speakers = {
+            item["speaker"] for item in processed_val
+        }
+
+        unknown_speakers = (
+            processed_val_speakers - set(processed_train_speakers)
+        )
+
+        if unknown_speakers:
+            raise RuntimeError(
+                "These validation speakers have no successful training "
+                "recordings: {}".format(sorted(unknown_speakers))
+            )
+
+        speakers = {
+            speaker: index
+            for index, speaker in enumerate(processed_train_speakers)
+        }
+
+        print("Successfully processed training speakers:", len(speakers))
+
+        # Ensure training features were generated
+        if not processed_train:
+            raise RuntimeError(
+                "No training recordings were successfully processed."
+            )
+
+        if not hasattr(pitch_scaler, "mean_"):
+            raise RuntimeError("No usable training pitch values found.")
+
+        if not hasattr(energy_scaler, "mean_"):
+            raise RuntimeError("No usable training energy values found.")
+
+        # Calculate normalization statistics from training only
+        if self.pitch_normalization:
+            pitch_mean = float(pitch_scaler.mean_[0])
+            pitch_std = float(pitch_scaler.scale_[0])
+        else:
+            pitch_mean = 0.0
+            pitch_std = 1.0
+
+        if self.energy_normalization:
+            energy_mean = float(energy_scaler.mean_[0])
+            energy_std = float(energy_scaler.scale_[0])
+        else:
+            energy_mean = 0.0
+            energy_std = 1.0
+
+        # Normalize only files generated in this run
+        # Min/max statistics are calculated from training files only
+        def normalize_features(feature, mean, std):
+            train_min = np.inf
+            train_max = -np.inf
+
+            for item in processed_train + processed_val:
+                speaker = item["speaker"]
+                basename = item["basename"]
+
+                filename = "{}-{}-{}.npy".format(
+                    speaker, feature, basename
+                )
+
+                path = os.path.join(
+                    self.out_dir, feature, filename
+                )
+
+                values = np.load(path)
+                values = (values - mean) / std
+                np.save(path, values)
+
+                if item["split"] == "train" and values.size > 0:
+                    train_min = min(train_min, float(np.min(values)))
+                    train_max = max(train_max, float(np.max(values)))
+
+            if not np.isfinite(train_min) or not np.isfinite(train_max):
+                raise RuntimeError(
+                    "Could not calculate {} training range.".format(feature)
+                )
+
+            return train_min, train_max
+
+        pitch_min, pitch_max = normalize_features(
+            "pitch", pitch_mean, pitch_std
+        )
+
+        energy_min, energy_max = normalize_features(
+            "energy", energy_mean, energy_std
+        )
+
+        # Save speaker mapping
+        with open(
+            os.path.join(self.out_dir, "speakers.json"),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(speakers, f, indent=2)
+
+        # Save normalization statistics
+        stats = {
+            "pitch": [
+                float(pitch_min),
+                float(pitch_max),
+                float(pitch_mean),
+                float(pitch_std)
+            ],
+            "energy": [
+                float(energy_min),
+                float(energy_max),
+                float(energy_mean),
+                float(energy_std)
+            ]
+        }
+
+        with open(
+            os.path.join(self.out_dir, "stats.json"),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(stats, f, indent=2)
+
+        # Write the exact training and validation metadata
+        train_metadata = [
+            item["info"] for item in processed_train
+        ]
+
+        val_metadata = [
+            item["info"] for item in processed_val
+        ]
+
+        with open(
+            os.path.join(self.out_dir, "train.txt"),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            for line in train_metadata:
+                f.write(line + "\n")
+
+        with open(
+            os.path.join(self.out_dir, "val.txt"),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            for line in val_metadata:
+                f.write(line + "\n")
+
+        print("\nSvarah preprocessing completed.")
+        print("Successful training recordings:", len(processed_train))
+        print("Successful validation recordings:", len(processed_val))
+        print("Skipped recordings:", len(skipped))
+        print(
+            "Processed audio duration: {:.4f} hours".format(
+                total_frames * self.hop_length /
+                self.sampling_rate / 3600
+            )
+        )
+
+        if skipped:
+            print("Skipped filenames (first 20):")
+            for filename in skipped[:20]:
+                print(filename)
+
+        return train_metadata + val_metadata
 
     def process_utterance(self, speaker, basename):
         wav_path = os.path.join(self.in_dir, speaker, "{}.wav".format(basename))
@@ -167,6 +491,10 @@ class Preprocessor:
         text = "{" + " ".join(phone) + "}"
         if start >= end:
             return None
+        if basename == "LJ001-0001":
+            print("DEBUG start:", start)
+            print("DEBUG end:", end)
+            print("DEBUG phone count:", len(phone))
 
         # Read and trim wav files
         wav, _ = librosa.load(wav_path)
@@ -185,6 +513,11 @@ class Preprocessor:
             frame_period=self.hop_length / self.sampling_rate * 1000,
         )
         pitch = pw.stonemask(wav.astype(np.float64), pitch, t, self.sampling_rate)
+        if basename == "LJ001-0001":
+           print("DEBUG audio length:", len(wav))
+           print("DEBUG pitch frames:", len(pitch))
+           print("DEBUG voiced frames:", np.sum(pitch != 0))
+           print("DEBUG maximum pitch:", np.max(pitch))
 
         pitch = pitch[: sum(duration)]
         if np.sum(pitch != 0) <= 1:

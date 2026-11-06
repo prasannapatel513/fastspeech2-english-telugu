@@ -1,7 +1,6 @@
 import re
 import argparse
 from string import punctuation
-
 import torch
 import yaml
 import numpy as np
